@@ -1,0 +1,21 @@
+{
+  "name": "sse-edge",
+  "stack": "fir",
+  "formation": {
+    "web": { "quantity": 2, "size": "performance-l" }
+  },
+  "addons": [
+    { "plan": "heroku-redis:premium-0" },
+    { "plan": "heroku-postgresql:standard-0" },
+    { "plan": "papertrail:choklad" }
+  ],
+  "env": {
+    "NODE_ENV":          { "value": "production" },
+    "JWT_ISSUER":        { "required": true },
+    "JWT_AUDIENCE":      { "required": true },
+    "JWT_JWKS_URL":      { "required": true },
+    "ALLOWED_ORIGINS":   { "required": true },
+    "HEARTBEAT_MS":      { "value": "15000" },
+    "MAX_CONN_PER_USER": { "value": "1" }
+  }
+}
