@@ -172,57 +172,57 @@ The same flow rendered in Mermaid (renders on GitHub):
 sequenceDiagram
     autonumber
     participant B as Browser (React)
-    participant L as SFDC LWR (uiBundle)
+    participant L as SFDC LWR uiBundle
     participant A as Apex ChatTokenBroker
     participant I as External IdP
     participant E as Heroku SSE Edge
     participant R as Redis Streams
     participant W as LLM Worker
-    participant T as Apex Trigger / Chat_Message__c
+    participant T as Apex Trigger and Chat_Message__c
 
     B->>L: GET /chat
-    L-->>B: HTML + JS bundle
-    B->>L: loadHistory() — GraphQL via @salesforce/sdk-data
-    L-->>B: prior Chat_Conversation__c / Chat_Message__c
+    L-->>B: HTML and JS bundle
+    B->>L: loadHistory via GraphQL (@salesforce/sdk-data)
+    L-->>B: prior Chat_Conversation__c and Chat_Message__c
 
-    B->>A: getSseToken() (Apex invocable)
-    A->>I: Named Cred callout — mint user-scoped JWT
+    B->>A: getSseToken (Apex invocable)
+    A->>I: Named Cred callout to mint user-scoped JWT
     I-->>A: JWT
-    A-->>B: { jwt, sseUrl, exp }
+    A-->>B: jwt, sseUrl, exp
 
-    Note over B,E: Direct browser → Heroku (NOT proxied through Salesforce)
-    B->>+E: GET /sse  Authorization: Bearer <jwt>, Last-Event-ID: 42
-    E->>E: verifyJwt (jose + JWKS)
-    E->>R: XREAD BLOCK chat:user:<id>
-    E-->>B: 200 OK  Content-Type: text/event-stream (body stays open)
+    Note over B,E: Direct browser to Heroku, NOT proxied through Salesforce
+    B->>E: GET /sse with Bearer JWT and Last-Event-ID 42
+    E->>E: verifyJwt via jose and JWKS
+    E->>R: XREAD BLOCK chat user stream
+    E-->>B: 200 OK text/event-stream (body stays open)
 
-    B->>E: POST /send { content: "hi" }
+    B->>E: POST /send with content
     E->>R: XADD worker-inbox
-    E-->>B: { messageId: "abc" }
+    E-->>B: messageId
     R-->>W: consume worker-inbox
 
     loop For each token delta (sub-50ms each)
-        W->>R: XADD chat:user:<id> { type:"token", data:{...} }
+        W->>R: XADD chat user stream with token frame
         R-->>E: XREAD returns
-        E-->>B: SSE frame  event: token
-        Note over B: store.append(delta) → re-render last bubble
+        E-->>B: SSE frame event token
+        Note over B: store append delta and re-render last bubble
     end
 
-    W->>R: XADD chat:user:<id> { type:"message_complete" }
+    W->>R: XADD chat user stream with message_complete
     W-->>T: Pub/Sub publish Chat_Message_Finalized__e
     T->>T: Apex trigger upserts Chat_Message__c
     R-->>E: XREAD returns
-    E-->>B: SSE frame  event: message_complete
-    Note over B: reconcile streamingMessage → messages[]; aria-live announce
+    E-->>B: SSE frame event message_complete
+    Note over B: reconcile streaming message and aria-live announce
 
-    loop Every 15s
-        E-->>B: : ping (heartbeat comment)
+    loop Every 15 seconds
+        E-->>B: heartbeat ping comment
     end
 
-    Note over B,E: Network drop / dyno cycle → fetch stream ends
-    B->>E: reconnect with Last-Event-ID (1→30s jittered backoff)
+    Note over B,E: Network drop or dyno cycle ends the fetch stream
+    B->>E: reconnect with Last-Event-ID (jittered backoff up to 30s)
     E->>R: XREAD from Last-Event-ID
-    E-->>-B: resume frames from last delivered event
+    E-->>B: resume frames from last delivered event
 ```
 
 **Key facts the diagram makes explicit:**
