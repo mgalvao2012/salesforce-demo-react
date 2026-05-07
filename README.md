@@ -54,9 +54,9 @@ Finalized messages are persisted to Salesforce custom objects via Platform Event
 │                          │ Named Credential + External Credential                          │
 │                          ▼                                                                 │
 └──────────────────────────┼─────────────────────────────────────────────────────────────────┘
-                           │ (JWT mint)                                       ▲ publish on
-                           │                                                  │ message_complete
-                           ▼                                                  │
+                           │ (JWT mint)                                      ▲ publish on
+                           │                                                 │ message_complete
+                           ▼                                                 │
 ┌──────────────────── External / Cloud (team-owned) ─────────────────────────┼──────────────┐
 │                                                                            │              │
 │   ┌─────────────┐   ┌──────────────────┐     ┌─────────────────────┐       │              │
@@ -78,12 +78,12 @@ Finalized messages are persisted to Salesforce custom objects via Platform Event
 │                                │          │  NATS JetStream /        │                    │
 │                                │          │  Redis Streams           │                    │
 │                                │          └─────▲────────────────────┘                    │
-│                                │                │ publish                                  │
+│                                │                │ publish                                 │
 │                                │          ┌─────┴──────────────┐                          │
 │                                │          │ LLM / App workers  │                          │
 │                                │          │ (producers)        │                          │
 │                                │          └────────┬───────────┘                          │
-│                                │                   │ writes finalized state                │
+│                                │                   │ writes finalized state               │
 │                                │          ┌────────▼───────────┐                          │
 │                                │          │ Hot DB             │                          │
 │                                │          │ (Postgres/DynamoDB)│                          │
@@ -102,14 +102,14 @@ The browser holds **one long-lived HTTPS connection** directly from the user's b
 │Browser │   │SFDC LWR │   │Apex     │   │External  │   │Heroku   │   │Redis    │   │LLM   │
 │(React) │   │uiBundle │   │Token    │   │IdP       │   │SSE Edge │   │Streams  │   │Worker│
 └───┬────┘   └────┬────┘   │Broker   │   └────┬─────┘   └────┬────┘   └────┬────┘   └──┬───┘
-    │             │        └────┬────┘        │              │              │           │
-    │ 1. GET /chat              │             │              │              │           │
-    ├────────────▶│             │             │              │              │           │
-    │ HTML+JS bundle            │             │              │              │           │
-    │◀────────────┤             │             │              │              │           │
-    │                                                                                   │
-    │ 2. loadHistory() — GraphQL via @salesforce/sdk-data                               │
-    │                                                                                   │
+    │             │        └────┬────┘        │              │             │           │
+    │ 1. GET /chat              │             │              │             │           │
+    ├────────────▶│             │             │              │             │           │
+    │ HTML+JS bundle            │             │              │             │           │
+    │◀────────────┤             │             │              │             │           │
+    │                                                                                  │
+    │ 2. loadHistory() — GraphQL via @salesforce/sdk-data                              │
+    │                                                                                  │
     │ 3. getSseToken() — Apex invocable                                                 │
     ├────────────▶│ ──────────▶│             │              │              │           │
     │             │            │ 4. Named Cred callout (mint user-scoped JWT)          │
@@ -164,6 +164,65 @@ The browser holds **one long-lived HTTPS connection** directly from the user's b
     │                                                                                   │
 
   Legend:  ──▶ short request/response   ═══▶ long-lived HTTPS (browser ↔ Heroku, never relayed via SFDC)
+```
+
+The same flow rendered in Mermaid (renders on GitHub):
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant B as Browser (React)
+    participant L as SFDC LWR (uiBundle)
+    participant A as Apex ChatTokenBroker
+    participant I as External IdP
+    participant E as Heroku SSE Edge
+    participant R as Redis Streams
+    participant W as LLM Worker
+    participant T as Apex Trigger / Chat_Message__c
+
+    B->>L: GET /chat
+    L-->>B: HTML + JS bundle
+    B->>L: loadHistory() — GraphQL via @salesforce/sdk-data
+    L-->>B: prior Chat_Conversation__c / Chat_Message__c
+
+    B->>A: getSseToken() (Apex invocable)
+    A->>I: Named Cred callout — mint user-scoped JWT
+    I-->>A: JWT
+    A-->>B: { jwt, sseUrl, exp }
+
+    Note over B,E: Direct browser → Heroku (NOT proxied through Salesforce)
+    B->>+E: GET /sse  Authorization: Bearer <jwt>, Last-Event-ID: 42
+    E->>E: verifyJwt (jose + JWKS)
+    E->>R: XREAD BLOCK chat:user:<id>
+    E-->>B: 200 OK  Content-Type: text/event-stream (body stays open)
+
+    B->>E: POST /send { content: "hi" }
+    E->>R: XADD worker-inbox
+    E-->>B: { messageId: "abc" }
+    R-->>W: consume worker-inbox
+
+    loop For each token delta (sub-50ms each)
+        W->>R: XADD chat:user:<id> { type:"token", data:{...} }
+        R-->>E: XREAD returns
+        E-->>B: SSE frame  event: token
+        Note over B: store.append(delta) → re-render last bubble
+    end
+
+    W->>R: XADD chat:user:<id> { type:"message_complete" }
+    W-->>T: Pub/Sub publish Chat_Message_Finalized__e
+    T->>T: Apex trigger upserts Chat_Message__c
+    R-->>E: XREAD returns
+    E-->>B: SSE frame  event: message_complete
+    Note over B: reconcile streamingMessage → messages[]; aria-live announce
+
+    loop Every 15s
+        E-->>B: : ping (heartbeat comment)
+    end
+
+    Note over B,E: Network drop / dyno cycle → fetch stream ends
+    B->>E: reconnect with Last-Event-ID (1→30s jittered backoff)
+    E->>R: XREAD from Last-Event-ID
+    E-->>-B: resume frames from last delivered event
 ```
 
 **Key facts the diagram makes explicit:**
