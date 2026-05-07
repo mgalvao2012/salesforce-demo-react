@@ -1,0 +1,7 @@
+packages:
+  - "force-app/main/default/uiBundles/*"
+  - "apps/*"
+  - "packages/*"
+allowBuilds:
+  esbuild: false
+  msw: false

@@ -4,8 +4,10 @@ import type { ChatFrame } from '@chat/protocol';
 const redisUrl = process.env.REDIS_URL ?? 'redis://localhost:6379';
 const useTls = redisUrl.startsWith('rediss://');
 
+// Heroku Redis serves a self-signed cert on rediss://; relax verification
+// for that origin only so node-tls doesn't reject the chain.
 export const bus = new Redis(redisUrl, {
-  ...(useTls ? { tls: {} } : {}),
+  ...(useTls ? { tls: { rejectUnauthorized: false } } : {}),
   maxRetriesPerRequest: null,
   enableReadyCheck: true,
 });

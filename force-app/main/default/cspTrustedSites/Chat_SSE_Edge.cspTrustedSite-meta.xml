@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<CspTrustedSite xmlns="http://soap.sforce.com/2006/04/metadata">
+    <description
+  >Heroku-hosted SSE edge consumed by the React chat uiBundle.</description>
+    <endpointUrl>https://sse-edge-prod-6e1ea40ce0ee.herokuapp.com</endpointUrl>
+    <isActive>true</isActive>
+    <context>All</context>
+    <isApplicableToConnectSrc>true</isApplicableToConnectSrc>
+    <isApplicableToFrameSrc>false</isApplicableToFrameSrc>
+    <isApplicableToImgSrc>false</isApplicableToImgSrc>
+    <isApplicableToStyleSrc>false</isApplicableToStyleSrc>
+    <isApplicableToFontSrc>false</isApplicableToFontSrc>
+    <isApplicableToMediaSrc>false</isApplicableToMediaSrc>
+</CspTrustedSite>

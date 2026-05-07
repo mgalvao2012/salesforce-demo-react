@@ -1,0 +1,86 @@
+name: Deploy · Salesforce
+
+on:
+  pull_request:
+    paths:
+      - "force-app/**"
+      - "packages/chat-protocol/**"
+      - "sfdx-project.json"
+      - "pnpm-workspace.yaml"
+      - "tsconfig.base.json"
+      - "package.json"
+      - ".github/workflows/deploy-salesforce.yml"
+  push:
+    branches: [main]
+    paths:
+      - "force-app/**"
+      - "packages/chat-protocol/**"
+      - "sfdx-project.json"
+      - "pnpm-workspace.yaml"
+      - "tsconfig.base.json"
+      - "package.json"
+      - ".github/workflows/deploy-salesforce.yml"
+
+concurrency:
+  group: deploy-salesforce-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Sandbox for PRs, prod org for main. Both are sfdxAuthUrl secrets.
+      SF_AUTH_URL: ${{ github.event_name == 'push' && secrets.SF_AUTH_URL_PROD || secrets.SF_AUTH_URL_SANDBOX }}
+      TARGET_ORG: ${{ github.event_name == 'push' && 'prod' || 'sandbox' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install Salesforce CLI
+        run: npm install -g @salesforce/cli
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build shared protocol
+        run: pnpm --filter @chat/protocol build
+
+      - name: Build uiBundle
+        run: pnpm --filter base-react-app build
+
+      - name: Authenticate to Salesforce
+        run: |
+          if [ -z "$SF_AUTH_URL" ]; then
+            echo "::error::Missing SF_AUTH_URL secret for target $TARGET_ORG"
+            exit 1
+          fi
+          printf "%s" "$SF_AUTH_URL" > /tmp/sfauth
+          sf org login sfdx-url --sfdx-url-file /tmp/sfauth --alias $TARGET_ORG --set-default
+          rm -f /tmp/sfauth
+
+      - name: Validate deploy (dry-run, PR only)
+        if: github.event_name == 'pull_request'
+        run: |
+          sf project deploy validate \
+            --source-dir force-app \
+            --tests ChatTokenBrokerTest --tests ChatMessageWriterTest \
+            --test-level RunSpecifiedTests \
+            --wait 30
+
+      - name: Deploy to Salesforce (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          sf project deploy start \
+            --source-dir force-app \
+            --tests ChatTokenBrokerTest --tests ChatMessageWriterTest \
+            --test-level RunSpecifiedTests \
+            --wait 30

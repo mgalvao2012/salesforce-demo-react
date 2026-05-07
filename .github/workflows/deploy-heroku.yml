@@ -1,0 +1,60 @@
+name: Deploy · Heroku (sse-edge)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/sse-edge/**"
+      - "packages/chat-protocol/**"
+      - "pnpm-workspace.yaml"
+      - "tsconfig.base.json"
+      - "package.json"
+      - ".github/workflows/deploy-heroku.yml"
+
+concurrency:
+  group: deploy-heroku-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history; Heroku push needs ancestor commits
+
+      - name: Pre-flight check (build before pushing to Heroku)
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build shared protocol
+        run: pnpm --filter @chat/protocol build
+
+      - name: Build sse-edge
+        run: pnpm --filter sse-edge build
+
+      - name: Test sse-edge
+        run: pnpm --filter sse-edge test
+
+      # The Heroku app is configured with heroku-buildpack-monorepo
+      # (APP_BASE=apps/sse-edge), so a normal git push of the whole repo
+      # is correct — the buildpack chdirs into apps/sse-edge before the
+      # nodejs buildpack runs.
+      - name: Deploy to Heroku
+        uses: akhileshns/heroku-deploy@v3.13.15
+        with:
+          heroku_api_key: ${{ secrets.HEROKU_API_KEY }}
+          heroku_app_name: ${{ secrets.HEROKU_APP_NAME }}
+          heroku_email: ${{ secrets.HEROKU_EMAIL }}
+          healthcheck: "https://${{ secrets.HEROKU_APP_NAME }}.herokuapp.com/healthz"
+          rollbackonhealthcheckfailed: true

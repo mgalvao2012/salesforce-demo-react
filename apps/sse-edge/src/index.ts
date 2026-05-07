@@ -4,6 +4,7 @@ import { sseRoute } from './sse.js';
 import { sendRoute } from './send.js';
 import { healthRoutes } from './health.js';
 import { metricsRoute } from './metrics.js';
+import { oauthRoute } from './oauth.js';
 import { bus, busSub } from './bus.js';
 
 const allowedOrigins = (process.env.ALLOWED_ORIGINS ?? '').split(',').map((o) => o.trim()).filter(Boolean);
@@ -22,6 +23,7 @@ await app.register(cors, {
 
 await app.register(healthRoutes);
 await app.register(metricsRoute);
+await app.register(oauthRoute);
 await app.register(sseRoute);
 await app.register(sendRoute);
 

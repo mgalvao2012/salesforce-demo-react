@@ -1,0 +1,52 @@
+name: CI · sse-edge
+
+on:
+  pull_request:
+    paths:
+      - "apps/sse-edge/**"
+      - "packages/chat-protocol/**"
+      - "pnpm-workspace.yaml"
+      - "tsconfig.base.json"
+      - "package.json"
+      - ".github/workflows/ci-sse-edge.yml"
+  push:
+    branches: [main]
+    paths:
+      - "apps/sse-edge/**"
+      - "packages/chat-protocol/**"
+      - "pnpm-workspace.yaml"
+      - "tsconfig.base.json"
+      - "package.json"
+      - ".github/workflows/ci-sse-edge.yml"
+
+concurrency:
+  group: ci-sse-edge-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build shared protocol
+        run: pnpm --filter @chat/protocol build
+
+      - name: Test sse-edge
+        run: pnpm --filter sse-edge test
+
+      - name: Build sse-edge
+        run: pnpm --filter sse-edge build

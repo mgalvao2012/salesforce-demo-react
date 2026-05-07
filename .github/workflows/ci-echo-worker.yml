@@ -1,0 +1,52 @@
+name: CI · echo-worker
+
+on:
+  pull_request:
+    paths:
+      - "apps/echo-worker/**"
+      - "packages/chat-protocol/**"
+      - "pnpm-workspace.yaml"
+      - "tsconfig.base.json"
+      - "package.json"
+      - ".github/workflows/ci-echo-worker.yml"
+  push:
+    branches: [main]
+    paths:
+      - "apps/echo-worker/**"
+      - "packages/chat-protocol/**"
+      - "pnpm-workspace.yaml"
+      - "tsconfig.base.json"
+      - "package.json"
+      - ".github/workflows/ci-echo-worker.yml"
+
+concurrency:
+  group: ci-echo-worker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build shared protocol
+        run: pnpm --filter @chat/protocol build
+
+      - name: Test echo-worker
+        run: pnpm --filter echo-worker test
+
+      - name: Build echo-worker
+        run: pnpm --filter echo-worker build

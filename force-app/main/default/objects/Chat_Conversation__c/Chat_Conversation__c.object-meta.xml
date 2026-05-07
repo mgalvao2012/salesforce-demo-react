@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<CustomObject xmlns="http://soap.sforce.com/2006/04/metadata">
+    <deploymentStatus>Deployed</deploymentStatus>
+    <description
+  >One row per chat conversation. Source of truth for finalized chat history.</description>
+    <enableActivities>false</enableActivities>
+    <enableBulkApi>true</enableBulkApi>
+    <enableFeeds>false</enableFeeds>
+    <enableHistory>false</enableHistory>
+    <enableReports>true</enableReports>
+    <enableSearch>true</enableSearch>
+    <enableSharing>true</enableSharing>
+    <enableStreamingApi>true</enableStreamingApi>
+    <label>Chat Conversation</label>
+    <nameField>
+        <displayFormat>CONV-{0000000}</displayFormat>
+        <label>Conversation Number</label>
+        <type>AutoNumber</type>
+    </nameField>
+    <pluralLabel>Chat Conversations</pluralLabel>
+    <sharingModel>Private</sharingModel>
+</CustomObject>

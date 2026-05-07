@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<RemoteSiteSetting xmlns="http://soap.sforce.com/2006/04/metadata">
+    <description
+  >Allows ChatTokenBroker to call this org's own /services/oauth2/token via JWT Bearer.</description>
+    <disableProtocolSecurity>false</disableProtocolSecurity>
+    <isActive>true</isActive>
+    <url>https://ability-nosoftware-5380.scratch.my.salesforce.com</url>
+</RemoteSiteSetting>
