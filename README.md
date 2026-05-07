@@ -97,76 +97,7 @@ Finalized messages are persisted to Salesforce custom objects via Platform Event
 
 The browser holds **one long-lived HTTPS connection** directly from the user's browser (running the React uiBundle served by Salesforce LWR) to the Heroku-hosted SSE edge. **Salesforce is NOT a relay.** The edge pushes bytes into that open connection; the browser parses each frame and updates the React store.
 
-```
-┌────────┐   ┌─────────┐   ┌─────────┐   ┌──────────┐   ┌─────────┐   ┌─────────┐   ┌──────┐
-│Browser │   │SFDC LWR │   │Apex     │   │External  │   │Heroku   │   │Redis    │   │LLM   │
-│(React) │   │uiBundle │   │Token    │   │IdP       │   │SSE Edge │   │Streams  │   │Worker│
-└───┬────┘   └────┬────┘   │Broker   │   └────┬─────┘   └────┬────┘   └────┬────┘   └──┬───┘
-    │             │        └────┬────┘        │              │             │           │
-    │ 1. GET /chat              │             │              │             │           │
-    ├────────────▶│             │             │              │             │           │
-    │ HTML+JS bundle            │             │              │             │           │
-    │◀────────────┤             │             │              │             │           │
-    │                                                                                  │
-    │ 2. loadHistory() — GraphQL via @salesforce/sdk-data                              │
-    │                                                                                  │
-    │ 3. getSseToken() — Apex invocable                                                 │
-    ├────────────▶│ ──────────▶│             │              │              │           │
-    │             │            │ 4. Named Cred callout (mint user-scoped JWT)          │
-    │             │            ├────────────▶│              │              │           │
-    │             │            │◀──── JWT ───┤              │              │           │
-    │             │◀{jwt,sseUrl}│                                                       │
-    │◀──{jwt,sseUrl,exp}───────│                                                       │
-    │                                                                                   │
-    │ 5. fetchEventSource('https://sse.mycompany.com/sse',                              │
-    │       headers: { Authorization: 'Bearer <jwt>', 'Last-Event-ID': '42' })          │
-    │═══════════════════════════════════════════════════▶│                              │
-    │                  (direct browser → Heroku, NOT proxied through Salesforce)        │
-    │                                                    │ 6. verifyJwt (jose+JWKS)     │
-    │                                                    │ 7. XREAD BLOCK               │
-    │                                                    ├─────────────▶│               │
-    │   200 OK  Content-Type: text/event-stream                                         │
-    │◀═══════════════════════════════════════════════════│   (response body stays OPEN) │
-    │                                                                                   │
-    │ 8. POST /send {content:'hi'}                       │                              │
-    ├═══════════════════════════════════════════════════▶│ 9. XADD worker-inbox         │
-    │   {messageId:'abc'}                                │ ────────────▶│               │
-    │◀═══════════════════════════════════════════════════│              │ 10. consume   │
-    │                                                                  ├──────────────▶│
-    │                                              ┌── 11. produce token deltas ──┐    │
-    │                                              │ XADD chat:user:<id>          │    │
-    │                                              │  {type:'token',data:{...}}   │    │
-    │                                              │◀─────────────────────────────│    │
-    │                                                    │ 12. XREAD returns      │    │
-    │                                                    │◀───────────────────────│    │
-    │                                                    │ 13. res.write(SSE frame)│   │
-    │   ◀══ SSE frame ════════════════════════════════════│                            │
-    │   onmessage({id:51,event:'token',data:{...}})                                     │
-    │   → store.append(delta) → React re-renders last bubble                            │
-    │                                                                                   │
-    │   ... (repeat 11-13 for each token; sub-50ms each)                                │
-    │                                                                                   │
-    │                                              ┌── 14. message_complete ─────┐     │
-    │                                              │  XADD chat:user:<id>        │     │
-    │                                              │  + Pub/Sub publish          │     │
-    │                                              │   Chat_Message_Finalized__e ┼─▶ Apex
-    │                                              │                             │  Trigger
-    │                                              │                             │  writes
-    │                                              │                             │  Chat_Message__c
-    │   ◀══ SSE frame (message_complete) ═════════════════│                            │
-    │   → reconcile streamingMessage into messages[]; aria-live announce                │
-    │                                                                                   │
-    │   ─── (every 15s) ─── ":ping\n\n" ◀══════════════════│  heartbeat                 │
-    │                                                                                   │
-    │ 15. Network drop / dyno cycle → fetch stream ends                                 │
-    │   useSSE backoff (1→30s jitter) → reconnect with Last-Event-ID                    │
-    │═══════════════════════════════════════════════════▶│ resumes from last delivered  │
-    │                                                                                   │
-
-  Legend:  ──▶ short request/response   ═══▶ long-lived HTTPS (browser ↔ Heroku, never relayed via SFDC)
-```
-
-The same flow rendered in Mermaid (renders on GitHub):
+**Sequence Diagram (Mermaid Notation):**
 
 ```mermaid
 sequenceDiagram
