@@ -75,8 +75,8 @@ interface SessionEntry {
 const SESSION_TTL_MS = 25 * 60 * 1000;
 const sessions = new Map<string, SessionEntry>();
 
-function endpointHost(): string {
-  return new URL(loginUrl!).host;
+function endpointUrl(): string {
+  return new URL(loginUrl!).origin;
 }
 
 async function startSession(): Promise<string> {
@@ -95,7 +95,7 @@ async function startSession(): Promise<string> {
       },
       body: JSON.stringify({
         externalSessionKey,
-        instanceConfig: { endpoint: endpointHost() },
+        instanceConfig: { endpoint: endpointUrl() },
         streamingCapabilities: { chunkTypes: ['Text'] },
         bypassUser: true,
       }),
