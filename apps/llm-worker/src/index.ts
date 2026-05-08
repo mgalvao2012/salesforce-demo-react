@@ -8,8 +8,10 @@ import {
   type WorkerJob,
 } from './bus.js';
 import { appendMessage, closePool, loadHistory, migrate } from './db.js';
+import * as agentforce from './agentforce.js';
 import { streamChat } from './llm.js';
 import { buildPrompt } from './prompt.js';
+import { classifyTopic } from './router.js';
 import { publishFinalizedMessage } from './sfdc.js';
 
 const logger = pino({ level: process.env.LOG_LEVEL ?? 'info' });
@@ -37,35 +39,44 @@ async function handleJob(job: WorkerJob, signal: AbortSignal): Promise<void> {
   const priorHistory = history.filter((_, i) => i !== history.length - 1);
   const prompt = buildPrompt(priorHistory, job.content);
 
-  // 3. Stream the assistant response, publishing token deltas as they arrive.
+  // 3. Pick a backend: HR turns go to the Agentforce agent in the partner org.
+  const topic = await classifyTopic(job.content, signal);
+  logger.info({ conversationId: job.conversationId, topic }, 'router decision');
+
+  // 4. Stream the assistant response, publishing token deltas as they arrive.
   let assistantText = '';
   let tokens = 0;
+  const onDelta = async (delta: string): Promise<void> => {
+    assistantText += delta;
+    await publishToUser(job.userId, {
+      type: 'token',
+      data: { messageId: assistantMessageId, delta },
+    });
+  };
   try {
-    const result = await streamChat(
-      prompt,
-      {
-        onDelta: async (delta) => {
-          assistantText += delta;
-          await publishToUser(job.userId, {
-            type: 'token',
-            data: { messageId: assistantMessageId, delta },
-          });
-        },
-      },
-      signal,
-    );
+    const result =
+      topic === 'hr'
+        ? await agentforce.streamChat(
+            { conversationId: job.conversationId, userMessage: job.content },
+            { onDelta },
+            signal,
+          )
+        : await streamChat(prompt, { onDelta }, signal);
     tokens = result.tokens;
   } catch (err) {
     const message = (err as Error).message;
-    logger.error({ err: message, conversationId: job.conversationId }, 'llm stream failed');
+    logger.error(
+      { err: message, conversationId: job.conversationId, topic },
+      'llm stream failed',
+    );
     await publishToUser(job.userId, {
       type: 'error',
-      data: { code: 'llm_error', message },
+      data: { code: topic === 'hr' ? 'agentforce_error' : 'llm_error', message },
     });
     return;
   }
 
-  // 4. Finalize: persist + emit message_complete + fan out to Salesforce.
+  // 5. Finalize: persist + emit message_complete + fan out to Salesforce.
   await appendMessage({
     conversationId: job.conversationId,
     messageId: assistantMessageId,

@@ -1,10 +1,12 @@
 # llm-worker
 
 Production consumer for `chat:worker-inbox`. Streams replies from
-**Google Gemini** (via `@google/genai`), persists conversation turns in
-Heroku Postgres for prompt history, and fires `Chat_Message_Finalized__e`
-Platform Events to Salesforce so the existing Apex trigger writes them to
-`Chat_Message__c`.
+**Google Gemini** (via `@google/genai`) for general topics, or from an
+**Agentforce agent in a separate Salesforce org** for Human Resources
+topics (vacations, labor law, benefits, payroll, leave, etc.). Persists
+conversation turns in Heroku Postgres for prompt history, and fires
+`Chat_Message_Finalized__e` Platform Events to the primary Salesforce
+org so the existing Apex trigger writes them to `Chat_Message__c`.
 
 ## Run locally
 
@@ -55,17 +57,43 @@ Setup → App Manager → Manage → OAuth Policies, with a "Run As" user that h
 permission to publish `Chat_Message_Finalized__e`. The pre-existing JWT-bearer
 flow keeps working alongside it.
 
+## Agentforce env vars (HR routing)
+
+When all five vars below are set, the worker routes turns the topic router
+classifies as **HR** to the Agentforce agent. If any of them is missing —
+or `ROUTE_HR_TO_AGENTFORCE=false` — every turn keeps going to Gemini and
+Agentforce is bypassed entirely. This is the kill-switch.
+
+| Var                        | Purpose                                                                           |
+| -------------------------- | --------------------------------------------------------------------------------- |
+| `AGENTFORCE_LOGIN_URL`     | My-Domain login URL of the _partner_ org (e.g. `https://hr.my.salesforce.com`)    |
+| `AGENTFORCE_INSTANCE_URL`  | API host of the partner org (often the same as login URL)                         |
+| `AGENTFORCE_CLIENT_ID`     | Consumer Key of a Connected App **in the Agentforce org** with Client Credentials |
+| `AGENTFORCE_CLIENT_SECRET` | Consumer Secret of that Connected App                                             |
+| `AGENTFORCE_AGENT_ID`      | The agent identifier from Agent Builder in the partner org                        |
+
+One-time setup in the **Agentforce org** (not in this repo's metadata):
+
+1. Build / pick the HR agent and copy its `agentId`.
+2. Create a Connected App with OAuth scopes `api`, `sfap_api`, `chatbot_api`,
+   `refresh_token`, then enable **Client Credentials Flow** with a "Run As"
+   integration user that has access to the agent.
+3. Copy the Consumer Key / Consumer Secret / instance URL into the env vars
+   above (e.g. `heroku config:set AGENTFORCE_AGENT_ID=… -a sse-edge-prod`).
+
 ## Optional env vars
 
-| Var              | Default            | Purpose                                                             |
-| ---------------- | ------------------ | ------------------------------------------------------------------- |
-| `GEMINI_MODEL`   | `gemini-2.5-flash` | Override the chat model (e.g. `gemini-2.5-pro`, `gemini-2.0-flash`) |
-| `SYSTEM_PROMPT`  | hardcoded fallback | Override the system prompt                                          |
-| `HISTORY_LIMIT`  | `20`               | Max prior turns sent to the model                                   |
-| `CONSUMER_GROUP` | `llm`              | Redis Streams consumer group                                        |
-| `CONSUMER_NAME`  | `<group>-<pid>`    | Per-process consumer name                                           |
-| `SF_API_VERSION` | `v66.0`            | Salesforce REST API version                                         |
-| `LOG_LEVEL`      | `info`             | pino log level                                                      |
+| Var                      | Default            | Purpose                                                             |
+| ------------------------ | ------------------ | ------------------------------------------------------------------- |
+| `GEMINI_MODEL`           | `gemini-2.5-flash` | Override the chat model (e.g. `gemini-2.5-pro`, `gemini-2.0-flash`) |
+| `ROUTER_MODEL`           | `gemini-2.5-flash` | Override the topic-classifier model                                 |
+| `ROUTE_HR_TO_AGENTFORCE` | `true`             | Set to `false` to disable the HR route (kill-switch)                |
+| `SYSTEM_PROMPT`          | hardcoded fallback | Override the system prompt (Gemini path only)                       |
+| `HISTORY_LIMIT`          | `20`               | Max prior turns sent to the model                                   |
+| `CONSUMER_GROUP`         | `llm`              | Redis Streams consumer group                                        |
+| `CONSUMER_NAME`          | `<group>-<pid>`    | Per-process consumer name                                           |
+| `SF_API_VERSION`         | `v66.0`            | Salesforce REST API version                                         |
+| `LOG_LEVEL`              | `info`             | pino log level                                                      |
 
 ## Behavior
 
@@ -73,16 +101,21 @@ For each message in the inbox:
 
 1. **Persist** the user's turn in Postgres (`chat_history`, idempotent by `message_id`).
 2. **Load** up to `HISTORY_LIMIT` recent turns for the conversation.
-3. **Stream** Gemini via `client.models.generateContentStream(...)`, publishing
-   `token` frames to `chat:user:<userId>` as each delta arrives. The browser's
-   open SSE connection forwards them. The system prompt is sent as Gemini's
-   `systemInstruction`; assistant turns map to Gemini's `model` role.
-4. **Finalize**: persist the assistant turn, publish `message_complete`, and
+3. **Route**: a two-tier classifier picks `hr` or `general`.
+   - Tier 1: keyword/regex prefilter (English + Portuguese HR vocabulary).
+   - Tier 2: only on ambiguous turns — one Gemini structured-output call
+     returning `{topic: "hr" | "general"}`.
+4. **Stream**: HR turns go to the Agentforce Agent API (per-conversation
+   session, native `fetch()` SSE parser); general turns go to Gemini via
+   `client.models.generateContentStream(...)`. Either way, each text delta
+   is published as a `token` frame to `chat:user:<userId>` and the browser's
+   open SSE connection forwards it.
+5. **Finalize**: persist the assistant turn, publish `message_complete`, and
    fire-and-forget two `Chat_Message_Finalized__e` Platform Events (one for
    the user turn, one for the assistant turn). SFDC publish failures are
    logged but don't fail the chat — the events can be replayed from Postgres
    if needed.
-5. **ACK** the inbox entry. Errors publish an `error` frame to the user
+6. **ACK** the inbox entry. Errors publish an `error` frame to the user
    stream and ACK to avoid poison-message loops.
 
 ## Switching back to echo
