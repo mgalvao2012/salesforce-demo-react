@@ -12,85 +12,47 @@ The worker routes per-turn between two backends: **Google Gemini** for general t
 
 ### High-level component view
 
-```
-┌─────────────────────────── Salesforce (LWR / Experience Cloud) ────────────────────────────┐
-│                                                                                            │
-│   Browser (end user)                                                                       │
-│   ┌──────────────────────────────────────────────────────────────────────────────┐         │
-│   │  React uiBundle  (force-app/main/default/uiBundles/myreactapp)               │         │
-│   │    /chat route                                                               │         │
-│   │    ┌──────────────┐  ┌──────────────┐  ┌──────────────────────────────────┐  │         │
-│   │    │  ChatView    │  │  useSSE      │  │  chatStore (Zustand)             │  │         │
-│   │    │  (virtual.)  │◄─┤ fetchEventS. │◄─┤  messages / streamingId / status │  │         │
-│   │    └──────▲───────┘  └──────▲───────┘  └──────────────────────────────────┘  │         │
-│   │           │ send msg        │ stream tokens                                  │         │
-│   │    ┌──────┴────────────┐    │                                                │         │
-│   │    │ chatClient.ts     │    │                                                │         │
-│   │    │  - sendMessage()  │    │                                                │         │
-│   │    │  - getSseToken()  │    │                                                │         │
-│   │    │  - loadHistory()  │    │                                                │         │
-│   │    └────┬──────────┬───┘    │                                                │         │
-│   │         │ GraphQL  │ Apex   │ HTTPS (Bearer JWT)                             │         │
-│   └─────────┼──────────┼────────┼────────────────────────────────────────────────┘         │
-│             │          │        │                                                          │
-│   ┌─────────▼──────────▼────┐   │        CSP Trusted URL allows connect-src                │
-│   │  @salesforce/sdk-data   │   │                                                          │
-│   │  (GraphQL + Apex)       │   │                                                          │
-│   └─────────┬──────────┬────┘   │                                                          │
-│             │          │        │                                                          │
-│   ┌─────────▼──┐  ┌────▼──────────────┐   ┌─────────────────────────────┐                  │
-│   │ GraphQL    │  │ Apex              │   │  Platform Event             │                  │
-│   │ (history   │  │ ChatTokenBroker   │   │  Chat_Message_Finalized__e  │                  │
-│   │  read)     │  │  mintToken()      │   │  + Trigger -> Writer        │                  │
-│   └────┬───────┘  └─────┬─────────────┘   └──────────▲──────────────────┘                  │
-│        │                │                            │                                     │
-│   ┌────▼────────────────▼────────────────────────────┴──────────────────┐                  │
-│   │  Custom Objects                                                     │                  │
-│   │   Chat_Conversation__c                                              │                  │
-│   │   Chat_Message__c                                                   │                  │
-│   │   (planned: Big Object Chat_Message_Archive__b — see "Future")      │                  │
-│   └─────────────────────────────────────────────────────────────────────┘                  │
-│                          │                                                                 │
-│                          │ Named Credential + External Credential                          │
-│                          ▼                                                                 │
-└──────────────────────────┼─────────────────────────────────────────────────────────────────┘
-                           │ (JWT mint)                                      ▲ publish on
-                           │                                                 │ message_complete
-                           ▼                                                 │
-┌──────────────────── External / Cloud (team-owned) ─────────────────────────┼──────────────┐
-│                                                                            │              │
-│   ┌─────────────┐   ┌──────────────────┐     ┌─────────────────────┐       │              │
-│   │  IdP /      │   │  CloudFront /    │     │  SSE Edge (Node/Go) │       │              │
-│   │  JWT mint   │   │  ALB  (HTTP/2)   │────▶│  stateless          │───────┘              │
-│   └─────────────┘   └──────────▲───────┘     │  - auth verify      │                      │
-│                                │             │  - heartbeat        │                      │
-│                       Browser  │             │  - backpressure     │                      │
-│                     GET /sse   │             └─────┬──────┬────────┘                      │
-│                  (Bearer JWT)  │                   │      │                               │
-│                                │                   │      │ subscribe                     │
-│                                │      ┌────────────▼───┐  │                               │
-│                                │      │  POST /send    │  │                               │
-│                                │      │  (REST)        │  │                               │
-│                                │      └─────────┬──────┘  │                               │
-│                                │                │         │                               │
-│                                │          ┌─────▼─────────▼──────────┐                    │
-│                                │          │  Event bus               │                    │
-│                                │          │  NATS JetStream /        │                    │
-│                                │          │  Redis Streams           │                    │
-│                                │          └─────▲────────────────────┘                    │
-│                                │                │ publish                                 │
-│                                │          ┌─────┴──────────────┐                          │
-│                                │          │ LLM / App workers  │                          │
-│                                │          │ (producers)        │                          │
-│                                │          └────────┬───────────┘                          │
-│                                │                   │ writes finalized state               │
-│                                │          ┌────────▼───────────┐                          │
-│                                │          │ Hot DB             │                          │
-│                                │          │ (Postgres/DynamoDB)│                          │
-│                                │          └────────────────────┘                          │
-│                                │                                                          │
-│             Observability: Prometheus / Grafana / Loki                                    │
-└───────────────────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph SF["Salesforce — primary org (LWR / Experience Cloud)"]
+        Browser["Browser<br/>React uiBundle<br/>ChatView · useSSE · chatStore"]
+        Apex["Apex<br/>ChatTokenBroker.mintToken()"]
+        GraphQL["GraphQL<br/>history read"]
+        PE["Platform Event<br/>Chat_Message_Finalized__e<br/>+ Trigger → Writer"]
+        Obj["Custom Objects<br/>Chat_Conversation__c<br/>Chat_Message__c<br/>(planned: Chat_Message_Archive__b)"]
+        IdP["Named + External Credential<br/>(JWT mint, server-side secret)"]
+    end
+
+    subgraph Edge["External / Cloud — Heroku (team-owned)"]
+        SSE["SSE Edge (Fastify)<br/>stateless · JWT verify ·<br/>heartbeat · backpressure"]
+        Send["POST /send (REST)"]
+        Bus["Event bus<br/>Redis Streams<br/>(NATS JetStream alt)"]
+        Worker["llm-worker<br/>topic router"]
+        DB["Hot DB<br/>Postgres"]
+    end
+
+    subgraph LLM["LLM backends"]
+        Gemini["Google Gemini<br/>general topics"]
+        AF["Agentforce Agent API<br/>partner Salesforce org<br/>(HR topics)"]
+    end
+
+    Browser -- "GraphQL" --> GraphQL
+    Browser -- "Apex" --> Apex
+    Apex --> IdP
+    Browser -- "GET /sse + POST /send<br/>Bearer JWT" --> SSE
+    Browser --> Send
+    Send --> Bus
+    Bus -- "subscribe" --> SSE
+    SSE -- "stream tokens" --> Browser
+    Bus -- "consume" --> Worker
+    Worker -- "topic=general" --> Gemini
+    Worker -- "topic=hr" --> AF
+    Gemini -- "token deltas" --> Bus
+    AF -- "token deltas" --> Bus
+    Worker --> DB
+    Worker -- "publish on<br/>message_complete" --> PE
+    PE --> Obj
+    GraphQL --> Obj
 ```
 
 ### How the React UI gets notified from the SSE edge
@@ -108,7 +70,9 @@ sequenceDiagram
     participant I as External IdP
     participant E as Heroku SSE Edge
     participant R as Redis Streams
-    participant W as LLM Worker
+    participant W as LLM Worker (router)
+    participant G as Gemini API
+    participant F as Agentforce Agent API (partner SF org)
     participant T as Apex Trigger and Chat_Message__c
 
     B->>L: GET /chat
@@ -132,7 +96,21 @@ sequenceDiagram
     E-->>B: messageId
     R-->>W: consume worker-inbox
 
+    Note over W: classifyTopic(text) → 'hr' or 'general'
+    alt topic = hr
+        W->>F: OAuth client_credentials + start session (cached per conversationId)
+        F-->>W: sessionId
+        W->>F: POST /messages/stream (text/event-stream)
+    else topic = general
+        W->>G: generateContentStream(prompt)
+    end
+
     loop For each token delta (sub-50ms each)
+        alt topic = hr
+            F-->>W: SSE chunk
+        else
+            G-->>W: stream chunk
+        end
         W->>R: XADD chat user stream with token frame
         R-->>E: XREAD returns
         E-->>B: SSE frame event token
@@ -163,6 +141,7 @@ sequenceDiagram
 3. The connection is **opened by the browser** and stays open. The edge writes into the open response body whenever Redis Streams delivers a new event for that user. Each `\n\n`-terminated frame triggers `fetchEventSource`'s `onmessage` callback synchronously.
 4. **No polling**, **no webhook into Salesforce for tokens**, **no Platform Event involved in the live UI path.** Platform Events only fire on `message_complete` for persistence.
 5. **Reconnect** is initiated by the browser when the fetch stream ends; the edge resumes from `Last-Event-ID` against Redis Streams, so no tokens are lost across dyno cycles or network blips.
+6. **Backend selection happens inside the worker**, after the inbox dispatch. The browser, edge, and Redis path don't know or care whether a given turn was answered by Gemini or Agentforce — they see the same `token` and `message_complete` frames either way.
 
 ### Runtime flows
 
