@@ -10,50 +10,127 @@ The worker routes per-turn between two backends: **Google Gemini** for general t
 
 ## Solution Architecture
 
-### High-level component view
+### System Context
+
+> **Last updated:** 2026-05-12 — Review quarterly or after major architecture changes
+
+```mermaid
+graph TB
+    Browser["Browser<br/>React Chat UI<br/>ChatView · useSSE · chatStore"]
+
+    subgraph SF["Salesforce (Primary Org)"]
+        style SF fill:#d4edda,stroke:#155724,stroke-width:3px
+        Auth["Auth Broker<br/>ChatTokenBroker<br/>JWT mint"]
+        GQL["GraphQL API<br/>history queries"]
+        SysDB[("Custom Objects<br/>Chat_Conversation__c<br/>Chat_Message__c")]
+    end
+
+    subgraph Heroku["Heroku (Team-owned)"]
+        style Heroku fill:#fff3cd,stroke:#856404,stroke-width:3px
+        Edge["SSE Edge<br/>Fastify · stateless<br/>~10K connections"]
+        Redis["Redis Streams<br/>pub/sub bus"]
+        Workers["LLM Workers<br/>topic router"]
+        HotDB[("Postgres<br/>hot state")]
+    end
+
+    Backends["LLM Backends<br/>Gemini · Agentforce"]
+
+    Browser =="streaming<br/>(direct, NOT proxied)"==> Edge
+    Browser -."history load<br/>(on mount)".-> GQL
+    Browser -- "JWT mint" --> Auth
+
+    Edge <--> Redis
+    Redis <--> Workers
+    Workers --> Backends
+    Workers --> HotDB
+    Workers -."Platform Event<br/>(fire & forget)".-> SysDB
+    GQL --> SysDB
+
+    classDef browser fill:#e1f5ff,stroke:#01579b,stroke-width:3px
+    classDef data fill:#e2e3e5,stroke:#383d41,stroke-width:2px
+    classDef backend fill:#f8d7da,stroke:#721c24,stroke-width:2px
+
+    class Browser browser
+    class SysDB,HotDB data
+    class Backends backend
+```
+
+**Key architectural decisions:**
+
+- **Direct browser → Heroku SSE connection** — The browser opens a long-lived HTTPS connection directly to the Heroku-hosted SSE edge, NOT proxied through Salesforce. This is enabled by CSP Trusted URLs and CORS configuration.
+- **Dual-database architecture** — Postgres holds hot, transient state for active conversations (high write volume, sub-50ms queries). Salesforce custom objects are the system of record for finalized messages (CRM linkage, sharing rules, audit trail, compliance).
+- **Redis Streams for fan-out** — Workers publish token frames to per-user Redis Streams; the edge subscribes and forwards to the browser. No sticky sessions required — any dyno can serve any user.
+- **Three distinct data paths** — Real-time streaming (thick lines, high volume), persistence (dotted lines, eventual consistency), and history loading (dotted lines, on-demand).
+
+**See also:** [Real-Time Streaming](#real-time-streaming) for frame-level details, [Persistence & History](#persistence--history) for the Platform Event flow.
+
+### Real-Time Streaming
+
+> **Last updated:** 2026-05-12 — Review quarterly or after major architecture changes
 
 ```mermaid
 flowchart TB
-    subgraph SF["Salesforce — primary org (LWR / Experience Cloud)"]
-        Browser["Browser<br/>React uiBundle<br/>ChatView · useSSE · chatStore"]
-        Apex["Apex<br/>ChatTokenBroker.mintToken()"]
-        GraphQL["GraphQL<br/>history read"]
-        PE["Platform Event<br/>Chat_Message_Finalized__e<br/>+ Trigger → Writer"]
-        Obj["Custom Objects<br/>Chat_Conversation__c<br/>Chat_Message__c<br/>(planned: Chat_Message_Archive__b)"]
-        IdP["Named + External Credential<br/>(JWT mint, server-side secret)"]
-    end
+    Browser["Browser<br/>useSSE hook<br/>chatStore"]
+    Send["POST /send<br/>messageId"]
+    SSE["GET /sse<br/>(long-lived connection)"]
 
-    subgraph Edge["External / Cloud — Heroku (team-owned)"]
-        SSE["SSE Edge (Fastify)<br/>stateless · JWT verify ·<br/>heartbeat · backpressure"]
-        Send["POST /send (REST)"]
-        Bus["Event bus<br/>Redis Streams<br/>(NATS JetStream alt)"]
-        Worker["llm-worker<br/>topic router"]
-        DB["Hot DB<br/>Postgres"]
-    end
+    Inbox[("worker-inbox<br/>Redis Stream")]
+    UserStream[("chat:user:{id}<br/>Redis Stream")]
 
-    subgraph LLM["LLM backends"]
-        Gemini["Google Gemini<br/>general topics"]
-        AF["Agentforce Agent API<br/>partner Salesforce org<br/>(HR topics)"]
-    end
+    Worker["LLM Worker<br/>handleJob()"]
 
-    Browser -- "GraphQL" --> GraphQL
-    Browser -- "Apex" --> Apex
-    Apex --> IdP
-    Browser -- "GET /sse + POST /send<br/>Bearer JWT" --> SSE
-    Browser --> Send
-    Send --> Bus
-    Bus -- "subscribe" --> SSE
-    SSE -- "stream tokens" --> Browser
-    Bus -- "consume" --> Worker
-    Worker -- "topic=general" --> Gemini
-    Worker -- "topic=hr" --> AF
-    Gemini -- "token deltas" --> Bus
-    AF -- "token deltas" --> Bus
-    Worker --> DB
-    Worker -- "publish on<br/>message_complete" --> PE
-    PE --> Obj
-    GraphQL --> Obj
+    Router{"classifyTopic()<br/>━━━━━━━━━━<br/>Tier 1: keyword prefilter<br/>Tier 2: Gemini classifier"}
+
+    Gemini["Gemini API<br/>generateContentStream<br/>(general topics)"]
+
+    AF["Agentforce Agent API<br/>POST /messages/stream<br/>(HR topics)"]
+
+    Browser -->|"user message"| Send
+    Send -->|"XADD"| Inbox
+    Inbox -->|"XREAD consume"| Worker
+
+    Worker --> Router
+    Router -->|"topic=general"| Gemini
+    Router -->|"topic=hr"| AF
+
+    Gemini -->|"token deltas"| UserStream
+    AF -->|"token deltas"| UserStream
+
+    UserStream -->|"XREAD subscribe"| SSE
+    SSE =="[token]<br/>[message_complete]<br/>[error]"==> Browser
+    SSE -."[ping] heartbeat<br/>every 15s".-> Browser
+
+    classDef router fill:#ffe0b2,stroke:#e65100,stroke-width:3px
+    classDef stream fill:#e2e3e5,stroke:#383d41,stroke-width:2px
+
+    class Router router
+    class Inbox,UserStream stream
 ```
+
+**Frame multiplexing over a single SSE stream:**
+
+The browser receives all frame types over one connection. Each frame has a `type` field:
+
+- **`token`** — Partial delta from the LLM (sub-50ms latency). Browser appends to `streamingMessage` ref; only the last bubble re-renders. These frames can be dropped under backpressure without breaking the UX.
+- **`message_complete`** — Assistant message finalized. Browser moves from `streamingMessage` to `messages[]`, announces via aria-live, reconciles with Salesforce persistence.
+- **`error`** — Worker or backend failure (`llm_error`, `agentforce_error`, etc.). Browser shows error banner but keeps the connection open.
+- **`tool_call`** — Tool invoked by the LLM. Wire support exists; UI rendering not yet implemented (planned).
+
+**Topic routing (2-tier classification):**
+
+1. **Tier 1 — Keyword prefilter** — Fast, synchronous regex matching on HR vocabulary in English + Portuguese (`vacation|PTO|payroll|labor law|benefits|férias|licença|salário|CLT`). Catches obvious HR turns (~90% of cases).
+2. **Tier 2 — Gemini structured-output fallback** — Only fires when Tier 1 is ambiguous. One extra Gemini call returns `{topic: "hr" | "general"}`.
+
+HR turns route to the Agentforce Agent API in a separate Salesforce org. General turns go to Gemini. Either way, token deltas land on the same per-user Redis Stream, so the edge, browser, and persistence logic are unchanged.
+
+**Backpressure & reliability:**
+
+- **MAX_CONN_PER_USER=1** enforced at the edge (config set, enforcement TODO in [apps/sse-edge/src/sse.ts](apps/sse-edge/src/sse.ts)).
+- **Heartbeat pings** every 15s keep ALB/CDN from cutting "idle" connections. If no ping for 45s, browser watchdog aborts and reconnects.
+- **Reconnect with Last-Event-ID** — Browser echoes the last frame ID; edge resumes from Redis Streams so no frames are lost across dyno cycles or network blips.
+- **Token frames droppable** — Under buffer congestion, the edge drops `token` frames but never drops discrete events (`message_complete`, `error`, `tool_call`).
+
+**See also:** [Error Handling & Recovery](#error-handling--recovery) for reconnect logic and failure modes, [How the React UI gets notified](#how-the-react-ui-gets-notified-from-the-sse-edge) for SSE wire protocol details.
 
 ### How the React UI gets notified from the SSE edge
 
@@ -143,32 +220,93 @@ sequenceDiagram
 5. **Reconnect** is initiated by the browser when the fetch stream ends; the edge resumes from `Last-Event-ID` against Redis Streams, so no tokens are lost across dyno cycles or network blips.
 6. **Backend selection happens inside the worker**, after the inbox dispatch. The browser, edge, and Redis path don't know or care whether a given turn was answered by Gemini or Agentforce — they see the same `token` and `message_complete` frames either way.
 
+### Persistence & History
+
+> **Last updated:** 2026-05-12 — Review quarterly or after major architecture changes
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant W as LLM Worker
+    participant PE as Chat_Message_Finalized__e
+    participant T as ChatMessageFinalizedTrigger
+    participant Writer as ChatMessageWriter
+    participant Conv as Chat_Conversation__c
+    participant Msg as Chat_Message__c
+
+    Note over W,Msg: Persistence Flow (async, fire-and-forget)
+    W->>PE: publish(conversationId, messageId,<br/>role, content, externalId)
+    Note right of W: Fire-and-forget:<br/>errors logged,<br/>don't block streaming
+    PE->>T: after insert
+    T->>Writer: handle(Trigger.new)
+    Writer->>Conv: upsert by External_Id__c<br/>(parent first, bulk-safe)
+    Note right of Conv: Idempotent:<br/>redelivery safe
+    Writer->>Msg: upsert by External_Id__c<br/>(bulk: 2 DML regardless of batch size)
+    Writer->>Conv: update Ended_At__c
+
+    Note over W,Msg: ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    participant B as Browser
+    participant GQL as GraphQL API
+
+    Note over B,Msg: History Load (on page mount)
+    B->>GQL: query Chat_Conversation__c<br/>+ Chat_Message__r (LIMIT N)
+    GQL->>Msg: SOQL with sharing
+    Msg-->>GQL: last N messages
+    GQL-->>B: seedFromHistory(messages)
+    Note left of B: Happens ONCE<br/>at mount, not per<br/>message
+```
+
+**Idempotency & bulk safety:**
+
+- **External_Id\_\_c upsert strategy** — Each `Chat_Conversation__c` and `Chat_Message__c` has a unique `External_Id__c` (UUID generated by the worker). `ChatMessageWriter` uses `Database.upsert(records, External_Id__c)` so Platform Event redelivery (Salesforce retries up to 3 days) never creates duplicates.
+- **Parent-first ordering** — Conversations are upserted before messages to satisfy the lookup relationship. The code uses `Database.upsert` in two phases (not a single DML with both types), so bulk batches stay safe.
+- **Bulk-safe regardless of batch size** — Whether the trigger fires for 1 event or 200 (max batch size), exactly 2 DML statements execute: one for conversations, one for messages. No per-record loops.
+
+**Fire-and-forget semantics:**
+
+The worker publishes the Platform Event and immediately moves on — it doesn't wait for Salesforce to confirm receipt or for the trigger to complete. If Platform Event publish fails (network, auth, governor limits), the error is logged but doesn't crash the worker or block the browser's streaming UX. The message stays in Postgres (hot state) and can be reconciled later via a batch job or manual retry.
+
+**GraphQL history load (separate path from streaming):**
+
+When the browser mounts the chat UI, it calls a GraphQL query to load the last N conversations and messages for the current user. This happens **once** at page load, not per message. The query respects `with sharing` and FLS, so users only see conversations/messages they own or have been granted access to via sharing rules.
+
+**Planned (not yet implemented):**
+
+- **Big Object archive** `Chat_Message_Archive__b` for >90-day retention. Older `Chat_Message__c` rows would be copied to the Big Object and deleted from the custom object, offloading cold storage to cheaper infrastructure. No metadata file exists yet in [force-app/main/default/objects/](force-app/main/default/objects/).
+
+**See also:** [Real-Time Streaming](#real-time-streaming) for how messages flow to the browser during active conversations, [apps/llm-worker/src/sfdc.ts](apps/llm-worker/src/sfdc.ts) for Platform Event publish logic, [force-app/main/default/classes/ChatMessageWriter.cls](force-app/main/default/classes/ChatMessageWriter.cls) for upsert implementation.
+
 ### Runtime flows
+
+> See [System Context](#system-context) for the architectural overview, [Real-Time Streaming](#real-time-streaming) for the streaming path, [Persistence & History](#persistence--history) for Salesforce persistence, and [Error Handling & Recovery](#error-handling--recovery) for failure modes.
 
 **A. Open chat (cold load)**
 
 1. User navigates to `/chat` in the LWR site.
-2. React uiBundle mounts → calls GraphQL via `@salesforce/sdk-data` to load last N `Chat_Conversation__c` + `Chat_Message__c` for current user.
+2. React uiBundle mounts → calls GraphQL via `@salesforce/sdk-data` to load last N `Chat_Conversation__c` + `Chat_Message__c` for current user. _(See [Persistence & History](#persistence--history) for GraphQL flow.)_
 3. Calls `ChatTokenBroker.mintToken()` via Apex → returns `{jwt, sseUrl, exp}`.
 4. `useSSE` opens `GET {sseUrl}` with `Authorization: Bearer {jwt}` and last known `Last-Event-ID`.
-5. Edge authenticates JWT, subscribes to the user's subject on the event bus, starts forwarding frames.
+5. Edge authenticates JWT, subscribes to the user's subject on the event bus, starts forwarding frames. _(See [Real-Time Streaming](#real-time-streaming) for SSE connection details.)_
 
 **B. Send message + stream response**
 
 1. User submits input → optimistic `{role:'user', status:'pending'}` appended to store.
-2. `POST /send` to external REST with JWT → returns `messageId`.
+2. `POST /send` to external REST with JWT → returns `messageId`. _(See [Real-Time Streaming](#real-time-streaming) for frame flow.)_
 3. Worker classifies the turn (HR vs general). HR turns stream from the Agentforce Agent API in the partner org; general turns stream from Gemini. Either way, token deltas land on the same per-user Redis Stream.
 4. Edge forwards frames as SSE → browser store appends to `streamingMessage` ref; only the last bubble re-renders.
-5. Worker emits `message_complete` frame **and** publishes Platform Event to Salesforce.
+5. Worker emits `message_complete` frame **and** publishes Platform Event to Salesforce. _(See [Persistence & History](#persistence--history) for Platform Event flow.)_
 6. Apex trigger (`ChatMessageFinalizedTrigger`) → `ChatMessageWriter` upserts `Chat_Message__c` + rolls `Chat_Conversation__c.Ended_At__c`.
 
 **C. Reconnect**
 
-1. Connection drops (network / Safari bfcache / 45s idle with no ping).
+1. Connection drops (network / Safari bfcache / 45s idle with no ping). _(See [Error Handling & Recovery](#error-handling--recovery) for failure modes.)_
 2. `useSSE` backs off (1 → 30s, jittered), refreshes token if expired.
 3. Reconnect sends `Last-Event-ID` → edge resumes from last event in the bus.
 
 ### How the client knows when the edge publishes — push, not poll
+
+> See [Real-Time Streaming](#real-time-streaming) for the high-level flow and frame types.
 
 SSE is one long-lived HTTP response whose body is never closed. The edge writes `data:` frames into that same response as events occur; the browser's `ReadableStream` parser fires a callback the instant a frame's terminating blank line arrives.
 
@@ -205,13 +343,15 @@ Why the push works end-to-end:
 - ALB idle timeout 600s; HTTP/2 multiplexing; heartbeat every 15s keeps LB/CDN from cutting "idle" conns.
 - Every frame has `id:` → client echoes `Last-Event-ID` on reconnect so the bus replays from the last delivered event.
 
-Failure detection client-side:
+Failure detection client-side _(see [Error Handling & Recovery](#error-handling--recovery) for detailed failure modes)_:
 
 - Clean close / network drop → fetch stream ends → backoff + reconnect with `Last-Event-ID`.
 - No pings for 45s → client watchdog aborts → reconnect.
 - 401 mid-stream → refresh JWT via `ChatTokenBroker` → reconnect.
 
 ### Browser ↔ Platform Events: not the same channel
+
+> See [Persistence & History](#persistence--history) for the Platform Event flow and [Real-Time Streaming](#real-time-streaming) for the browser's SSE path.
 
 `fetchEventSource` **does not** subscribe to Salesforce Platform Events. The two paths are independent:
 
@@ -263,12 +403,92 @@ Setting `ROUTE_HR_TO_AGENTFORCE=false` (or omitting any of the five `AGENTFORCE_
 
 ### Security boundaries
 
+> See [Error Handling & Recovery](#error-handling--recovery) for auth failure handling (JWT expiry, Agentforce session expiry).
+
 - **Browser ↔ Salesforce:** existing LWR session; `@AuraEnabled` gated by `ChatUser` permission set.
 - **Browser ↔ External Edge:** JWT Bearer (user-scoped, 5-min TTL) over TLS; CSP Trusted URL allows `connect-src`; CORS allow-list includes the LWR site origin.
 - **Salesforce ↔ IdP:** Named Credential + External Credential (client secret server-side only).
 - **Edge ↔ Bus ↔ Workers:** mTLS or VPC-internal; JWT re-verified at the edge on every connect.
 - **Worker ↔ Agentforce org:** OAuth2 client_credentials against a Connected App in the partner org; secret kept in Heroku config vars only. Run-As integration user has agent-invocation rights but no broader CRM access. Browser tokens are not used here — only the worker holds the partner-org secret.
 - **Salesforce custom objects:** with-sharing Apex, FLS enforced, optional Shield encryption on `Content__c`.
+
+### Error Handling & Recovery
+
+> **Last updated:** 2026-05-12 — Review quarterly or after major architecture changes
+
+```mermaid
+flowchart TB
+    Start([Error occurs])
+
+    Start --> CheckType{Error type?}
+
+    CheckType -->|"401 auth failure<br/>(JWT expired)"| RefreshToken["Browser: refresh JWT<br/>via ChatTokenBroker"]
+    RefreshToken --> Reconnect["Reconnect with<br/>Last-Event-ID"]
+
+    CheckType -->|"Agentforce 401<br/>(session expired)"| AgentRefresh["Worker: clear cached<br/>session for conversationId"]
+    AgentRefresh --> AgentRetry["Retry ONCE<br/>with new session"]
+    AgentRetry --> Success{Retry<br/>succeeds?}
+    Success -->|"Yes"| Continue["Continue streaming<br/>to browser"]
+    Success -->|"No"| ErrorFrame["Publish error frame<br/>code: agentforce_error"]
+
+    CheckType -->|"Gemini API error<br/>(rate limit, 5xx)"| LLMError["Publish error frame<br/>code: llm_error"]
+    LLMError --> BrowserError["Browser: show error banner<br/>keep connection open"]
+
+    CheckType -->|"Worker crash<br/>(uncaught exception)"| WorkerCrash["Worker: exit process<br/>Heroku restarts dyno"]
+    WorkerCrash --> JobRetry["Job redelivered from<br/>worker-inbox (at-least-once)"]
+
+    CheckType -->|"Platform Event<br/>publish failure"| LogOnly["Log warning<br/>DON'T block streaming"]
+    LogOnly --> StreamContinues["Browser still receives<br/>tokens normally"]
+
+    CheckType -->|"Network drop<br/>(fetch stream ends)"| BackoffReconnect["Browser: backoff<br/>1s → 30s (jittered)"]
+    BackoffReconnect --> TokenCheck{JWT<br/>expired?}
+    TokenCheck -->|"Yes"| RefreshToken
+    TokenCheck -->|"No"| Reconnect
+
+    CheckType -->|"No pings for 45s<br/>(watchdog timeout)"| WatchdogAbort["Browser: abort fetch<br/>and reconnect"]
+    WatchdogAbort --> Reconnect
+
+    CheckType -->|"Redis connection loss"| RedisDown["Worker/Edge: exit process<br/>platform restarts"]
+
+    CheckType -->|"Postgres connection<br/>pool exhausted"| PGError["Worker: log error<br/>publish error frame"]
+    PGError --> BrowserError
+
+    style RefreshToken fill:#fff3cd,stroke:#856404,stroke-width:2px
+    style AgentRefresh fill:#fff3cd,stroke:#856404,stroke-width:2px
+    style LogOnly fill:#d4edda,stroke:#155724,stroke-width:2px
+    style ErrorFrame fill:#f8d7da,stroke:#721c24,stroke-width:2px
+    style WorkerCrash fill:#f8d7da,stroke:#721c24,stroke-width:2px
+    style LLMError fill:#f8d7da,stroke:#721c24,stroke-width:2px
+    style RedisDown fill:#f8d7da,stroke:#721c24,stroke-width:2px
+```
+
+**Failure modes & recovery strategies:**
+
+| Error Type                          | Severity         | Recovery Strategy                                                                          | Implementation                                                                        |
+| ----------------------------------- | ---------------- | ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------- |
+| **Browser 401 (JWT expired)**       | Retryable        | Refresh JWT via `ChatTokenBroker`, reconnect with `Last-Event-ID`                          | [useSSE.ts:87](force-app/main/default/uiBundles/myreactapp/src/hooks/useSSE.ts#L87)   |
+| **Agentforce 401 (session expiry)** | Retryable        | Clear cached session, retry ONCE with new OAuth token                                      | [agentforce.ts:142](apps/llm-worker/src/agentforce.ts#L142)                           |
+| **Gemini rate limit / 5xx**         | Fatal (per turn) | Publish `error` frame to browser, log, don't retry                                         | [llm.ts:68](apps/llm-worker/src/llm.ts#L68)                                           |
+| **Worker uncaught exception**       | Fatal            | Exit process, Heroku restarts dyno, job redelivered (at-least-once semantics)              | [index.ts:32](apps/llm-worker/src/index.ts#L32)                                       |
+| **Platform Event publish failure**  | Logged, ignored  | Log warning, continue streaming. Postgres still has the message for manual reconciliation. | [sfdc.ts:94](apps/llm-worker/src/sfdc.ts#L94)                                         |
+| **Network drop / Safari bfcache**   | Retryable        | Jittered exponential backoff (1s → 30s), reconnect with `Last-Event-ID`                    | [useSSE.ts:102](force-app/main/default/uiBundles/myreactapp/src/hooks/useSSE.ts#L102) |
+| **No pings for 45s (watchdog)**     | Retryable        | Client watchdog aborts fetch, reconnects                                                   | [useSSE.ts:78](force-app/main/default/uiBundles/myreactapp/src/hooks/useSSE.ts#L78)   |
+| **Redis connection loss**           | Fatal            | Worker/Edge exits, platform restarts container                                             | Process supervisor                                                                    |
+| **Postgres pool exhausted**         | Fatal (per turn) | Publish `error` frame, log, alert oncall                                                   | [db.ts:45](apps/llm-worker/src/db.ts#L45)                                             |
+
+**Kill switches & operational controls:**
+
+- **`ROUTE_HR_TO_AGENTFORCE=false`** — Disables all Agentforce routing; every turn falls back to Gemini. Production kill-switch if the partner org is down. Requires worker dyno restart.
+- **`MAX_CONN_PER_USER=1`** — Config set in [apps/sse-edge/app.json](apps/sse-edge/app.json), enforcement code TODO. Prevents browser tab spam from exhausting dyno connections.
+- **Graceful shutdown on SIGTERM** — Edge/worker drain in-flight requests for up to 30s before Heroku forcibly kills the process. Reconnect logic handles mid-stream disconnects.
+
+**Why some errors don't block streaming:**
+
+Platform Event publish failures are logged but don't halt the worker or send an `error` frame to the browser. The message is already in Postgres (hot state) and has been streamed to the user — Salesforce persistence is **eventual consistency**, not a hard dependency. A batch job can reconcile missing `Chat_Message__c` rows from Postgres later, or ops can manually replay events.
+
+Similarly, Postgres write failures (rare, usually pool exhaustion) publish an `error` frame to the browser but don't crash the worker. The worker continues processing other jobs; the browser shows a banner for that specific turn.
+
+**See also:** [Real-Time Streaming](#real-time-streaming) for reconnect with Last-Event-ID, [apps/llm-worker/src/agentforce.ts](apps/llm-worker/src/agentforce.ts) for Agentforce session retry logic, [force-app/main/default/uiBundles/myreactapp/src/hooks/useSSE.ts](force-app/main/default/uiBundles/myreactapp/src/hooks/useSSE.ts) for browser reconnect implementation.
 
 ### Technology choices summary
 
